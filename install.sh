@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+brewfile="${repo_root}/Brewfile"
+git_config="${repo_root}/git/config"
+macos_defaults="${repo_root}/macos/defaults.sh"
+
+dry_run=false
+check_only=false
+skip_brew=false
+skip_macos=false
+
+usage() {
+  cat <<'EOF'
+Usage: ./install.sh [--check] [--dry-run] [--skip-brew] [--skip-macos]
+
+  --check       Verify the current installation without changing it.
+  --dry-run     Print the changes that would be made.
+  --skip-brew   Do not install packages from the Brewfile.
+  --skip-macos  Do not apply managed macOS settings.
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --check)
+      check_only=true
+      ;;
+    --dry-run)
+      dry_run=true
+      ;;
+    --skip-brew)
+      skip_brew=true
+      ;;
+    --skip-macos)
+      skip_macos=true
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'install: unsupported argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+links=()
+
+discover_tree() {
+  local source_root=$1
+  local target_root=$2
+  local source
+  local source_rel
+  local target_rel
+
+  while IFS= read -r -d '' source; do
+    source_rel="${source#"${repo_root}/"}"
+    target_rel="${source#"${source_root}/"}"
+    links+=("${source_rel}|${target_root}/${target_rel}")
+  done < <(find "$source_root" -type f -print0)
+}
+
+discover_tree "${repo_root}/fish" "${HOME}/.config/fish"
+discover_tree \
+  "${repo_root}/ghostty" \
+  "${HOME}/Library/Application Support/com.mitchellh.ghostty"
+discover_tree "${repo_root}/zed" "${HOME}/.config/zed"
+
+link_target() {
+  local target=$1
+  local target_dir
+  local raw_target
+
+  target_dir="$(cd -- "$(dirname -- "$target")" && pwd)"
+  raw_target="$(readlink "$target")"
+
+  if [[ "$raw_target" = /* ]]; then
+    printf '%s\n' "$raw_target"
+  else
+    (cd -- "$target_dir" && cd -- "$(dirname -- "$raw_target")" &&
+      printf '%s/%s\n' "$PWD" "$(basename -- "$raw_target")")
+  fi
+}
+
+has_git_include() {
+  local include
+
+  while IFS= read -r include; do
+    if [[ "$include" == "$git_config" ]]; then
+      return 0
+    fi
+  done < <(git config --global --get-all include.path 2>/dev/null || true)
+
+  return 1
+}
+
+is_macos() {
+  [[ "$(uname -s)" == "Darwin" ]]
+}
+
+if is_macos; then
+  links+=("macos/.hushlogin|${HOME}/.hushlogin")
+fi
+
+macos_login_shell() {
+  local user_name
+
+  user_name="$(id -un)"
+  id -P "$user_name" | awk -F: '{ print $10 }'
+}
+
+has_expected_macos_login_shell() {
+  local fish_path
+
+  fish_path="$(command -v fish 2>/dev/null)" || return 1
+
+  grep -Fqx -- "$fish_path" /etc/shells &&
+    [[ "$(macos_login_shell)" == "$fish_path" ]]
+}
+
+configure_macos_login_shell() {
+  local current_shell
+  local fish_path
+
+  if ! fish_path="$(command -v fish 2>/dev/null)"; then
+    printf 'install: Fish must be installed before configuring the login shell\n' >&2
+    return 1
+  fi
+
+  if ! grep -Fqx -- "$fish_path" /etc/shells; then
+    printf 'registering login shell: %s\n' "$fish_path"
+    printf '%s\n' "$fish_path" | sudo tee -a /etc/shells >/dev/null
+  fi
+
+  current_shell="$(macos_login_shell)"
+  if [[ "$current_shell" != "$fish_path" ]]; then
+    chsh -s "$fish_path"
+    printf 'configured login shell: %s\n' "$fish_path"
+  fi
+}
+
+has_expected_macos_defaults() {
+  local corner
+
+  [[ "$(defaults read com.apple.screencapture target 2>/dev/null)" == "clipboard" ]] &&
+    [[ "$(defaults read -g InitialKeyRepeat 2>/dev/null)" == "10" ]] &&
+    [[ "$(defaults read -g KeyRepeat 2>/dev/null)" == "1" ]] &&
+    [[ "$(defaults read -g AppleTemperatureUnit 2>/dev/null)" == "Celsius" ]] &&
+    [[ "$(defaults read -g com.apple.trackpad.scaling 2>/dev/null)" == "3" ]] &&
+    [[ "$(defaults read com.apple.dock show-recents 2>/dev/null)" == "0" ]] || return 1
+
+  for corner in tl tr bl br; do
+    [[ "$(defaults read com.apple.dock "wvous-${corner}-corner" 2>/dev/null)" == "0" ]] &&
+      [[ "$(defaults read com.apple.dock "wvous-${corner}-modifier" 2>/dev/null)" == "0" ]] || return 1
+  done
+
+  # defaults read emits numeric dictionary values as strings in its text output.
+  defaults -currentHost read -g com.apple.keyboard.modifiermapping.0-0-0 2>/dev/null |
+    plutil -convert json -o - - 2>/dev/null |
+    jq -e 'length == 1 and
+      (.[0].HIDKeyboardModifierMappingSrc | tonumber) == 30064771129 and
+      (.[0].HIDKeyboardModifierMappingDst | tonumber) == 30064771300' >/dev/null
+}
+
+has_expected_macos_dock() {
+  local dock_items
+  local expected_items
+
+  command -v dockutil >/dev/null 2>&1 || return 1
+  dock_items="$(dockutil --list | awk -F '\t' '$3 != "recentApps" { print $1 }')" || return 1
+  expected_items="$(printf '%s\n' Zed Ghostty 'Google Chrome' Slack Spotify \
+    'System Settings' Downloads)"
+  [[ "$dock_items" == "$expected_items" ]]
+}
+
+preflight_links() {
+  local conflict_count=0
+  local entry
+  local source_rel
+  local source
+  local target
+
+  for entry in "${links[@]}"; do
+    IFS='|' read -r source_rel target <<<"$entry"
+    source="${repo_root}/${source_rel}"
+
+    if [[ ! -e "$source" ]]; then
+      printf 'install: missing source: %s\n' "$source" >&2
+      ((conflict_count += 1))
+    elif [[ -L "$target" ]]; then
+      if [[ "$(link_target "$target")" != "$source" ]]; then
+        printf 'install: conflict: %s -> %s\n' "$target" "$(readlink "$target")" >&2
+        ((conflict_count += 1))
+      fi
+    elif [[ -e "$target" ]]; then
+      printf 'install: conflict: %s already exists\n' "$target" >&2
+      ((conflict_count += 1))
+    fi
+  done
+
+  if ((conflict_count > 0)); then
+    printf 'install: refusing to change anything; resolve the conflicts above\n' >&2
+    return 1
+  fi
+}
+
+check_installation() {
+  local failed=false
+  local entry
+  local source_rel
+  local source
+  local target
+  local command_name
+  local required_commands=(
+    bat difft fish fzf gh git delta jq just rg shellcheck shfmt tree zoxide
+  )
+
+  for entry in "${links[@]}"; do
+    IFS='|' read -r source_rel target <<<"$entry"
+    source="${repo_root}/${source_rel}"
+
+    if [[ ! -L "$target" ]] || [[ "$(link_target "$target")" != "$source" ]]; then
+      printf 'check: invalid link: %s\n' "$target" >&2
+      failed=true
+    fi
+  done
+
+  if ! has_git_include; then
+    printf 'check: missing Git include: %s\n' "$git_config" >&2
+    failed=true
+  fi
+
+  if [[ "$skip_macos" == false ]] && is_macos && ! has_expected_macos_defaults; then
+    printf 'check: managed macOS preferences do not match\n' >&2
+    failed=true
+  fi
+
+  if [[ "$skip_macos" == false ]] && is_macos && ! has_expected_macos_dock; then
+    printf 'check: managed Dock layout does not match (dockutil is required)\n' >&2
+    failed=true
+  fi
+
+  if [[ "$skip_macos" == false ]] && is_macos &&
+    ! has_expected_macos_login_shell; then
+    printf 'check: Fish is not configured as the macOS login shell\n' >&2
+    failed=true
+  fi
+
+  for command_name in "${required_commands[@]}"; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      printf 'check: missing command: %s\n' "$command_name" >&2
+      failed=true
+    fi
+  done
+
+  if [[ "$failed" == true ]]; then
+    return 1
+  fi
+
+  printf 'check: dotfiles are installed\n'
+}
+
+if [[ "$check_only" == true ]]; then
+  check_installation
+  exit
+fi
+
+preflight_links
+
+if [[ "$dry_run" == true ]]; then
+  for entry in "${links[@]}"; do
+    IFS='|' read -r source_rel target <<<"$entry"
+    source="${repo_root}/${source_rel}"
+    if [[ ! -L "$target" ]]; then
+      printf 'link: %s -> %s\n' "$target" "$source"
+    fi
+  done
+  if ! has_git_include; then
+    printf 'git include: %s\n' "$git_config"
+  fi
+  if [[ "$skip_brew" == false ]]; then
+    printf 'brew bundle: %s\n' "$brewfile"
+  fi
+  if [[ "$skip_macos" == false ]] && is_macos; then
+    printf 'macOS login shell: register and select Homebrew Fish\n'
+    printf 'macOS defaults: %s\n' "$macos_defaults"
+    printf 'macOS Dock: replace pinned items with Zed, Ghostty, Google Chrome, Slack, Spotify, Downloads; disable recents\n'
+  fi
+  exit
+fi
+
+if [[ "$skip_brew" == false ]]; then
+  if ! command -v brew >/dev/null 2>&1; then
+    printf 'install: Homebrew is required: https://brew.sh\n' >&2
+    exit 1
+  fi
+
+  brew bundle check --file="$brewfile" >/dev/null 2>&1 ||
+    brew bundle --file="$brewfile"
+fi
+
+if [[ "$skip_macos" == false ]] && is_macos; then
+  configure_macos_login_shell
+  "$macos_defaults"
+fi
+
+for entry in "${links[@]}"; do
+  IFS='|' read -r source_rel target <<<"$entry"
+  source="${repo_root}/${source_rel}"
+
+  if [[ ! -L "$target" ]]; then
+    mkdir -p -- "$(dirname -- "$target")"
+    ln -s -- "$source" "$target"
+    printf 'linked: %s -> %s\n' "$target" "$source"
+  fi
+done
+
+if ! has_git_include; then
+  git config --global --add include.path "$git_config"
+  printf 'configured Git include: %s\n' "$git_config"
+fi
